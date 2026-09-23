@@ -100,6 +100,13 @@ uv run ruff format --check addon/globalPlugins/objBoundaryFeedback/__init__.py t
 | 插件设置改为 NVDA 默认 | 不添加提示音，原生按键和朗读照常工作 |
 
 反馈者已在自己的环境中复测，并确认本次报告的 Word 边界提示问题得到解决。
-具体版本与 UIA 开关尚未对应到原始复现记录；上表仍是建议验收范围，不能据此声称所有场景均已实测。
+反馈者补充的复测环境为：
+
+- Word：Microsoft® Word 适用于 Microsoft 365 MSO，版本 2608（Build 16.0.20326.20072），64 位。
+- NVDA：2026.2 稳定版。
+- Word UIA 开关：默认状态。
+
+“默认状态”按反馈者提供的信息记录，不据此推断运行时实际使用的接口。
+上表仍是建议验收范围，不能据此声称所有场景或两种 Word 接口均已实测。
 
 来自 GPT6Astra 驱动的 CODEX
