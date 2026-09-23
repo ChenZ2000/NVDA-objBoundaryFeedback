@@ -21,6 +21,7 @@ import controlTypes
 import cursorManager
 from documentNavigation import paragraphHelper
 import editableText
+import eventHandler
 import globalVars
 import globalCommands
 import globalPluginHandler
@@ -156,25 +157,6 @@ def _getEditableValueSnapshot(obj: object | None) -> tuple[tuple[int, str, str],
 	return tuple(snapshot)
 
 
-def _directionFromEnclosingUnitBoundary(
-	info: textInfos.TextInfo,
-	unit: _TextUnit,
-) -> _BoundaryDirection | None:
-	try:
-		collapsedInfo = info.copy()
-		collapsedInfo.collapse()
-		unitInfo = collapsedInfo.copy()
-		unitInfo.expand(unit)
-		atStart = collapsedInfo.compareEndPoints(unitInfo, "startToStart") <= 0
-		atEnd = collapsedInfo.compareEndPoints(unitInfo, "endToEnd") >= 0
-	except Exception:
-		log.debugWarning("Unable to infer enclosing text boundary direction", exc_info=True)
-		return None
-	if atStart == atEnd:
-		return _GENERIC if atStart else None
-	return _PREVIOUS if atStart else _NEXT
-
-
 def _lineBoundaryIsDocumentBoundary(
 	info: textInfos.TextInfo,
 	direction: _BoundaryDirection,
@@ -193,27 +175,76 @@ def _lineBoundaryIsDocumentBoundary(
 		return not (canMovePastLineBoundary(previous=True) and canMovePastLineBoundary(previous=False))
 	except Exception:
 		log.debugWarning("Unable to inspect line boundary for boundary feedback", exc_info=True)
-		return True
+		return False
 
 
-def _directionFromTextBoundary(info: textInfos.TextInfo, unit: _TextUnit) -> _BoundaryDirection | None:
-	if unit == textInfos.UNIT_CHARACTER:
-		lineBoundaryDirection = _directionFromEnclosingUnitBoundary(info, textInfos.UNIT_LINE)
-		if lineBoundaryDirection is not None:
-			if _lineBoundaryIsDocumentBoundary(info, lineBoundaryDirection):
-				return lineBoundaryDirection
-			return None
+def _caretMovementFromGesture(gesture: inputCore.InputGesture) -> tuple[_BoundaryDirection, bool] | None:
+	"""Return the requested direction and whether this is an unmodified Home/End.
+
+	The helper's unit is the unit NVDA speaks, not necessarily the unit moved:
+	Page Down and Control+End, for example, both speak a line. Never infer the
+	key's direction or destination by probing TextInfo.move in both directions.
+	"""
+	directions: dict[str, _BoundaryDirection] = {
+		"uparrow": _PREVIOUS,
+		"leftarrow": _PREVIOUS,
+		"pageup": _PREVIOUS,
+		"home": _PREVIOUS,
+		"downarrow": _NEXT,
+		"rightarrow": _NEXT,
+		"pagedown": _NEXT,
+		"end": _NEXT,
+	}
+	for identifier in gesture.normalizedIdentifiers:
+		source, _, keys = identifier.partition(":")
+		if source != "kb" and not (source.startswith("kb(") and source.endswith(")")):
+			continue
+		keyNames = set(keys.split("+"))
+		for key, direction in directions.items():
+			if keyNames in ({key}, {"control", key}):
+				return direction, key in ("home", "end") and "control" not in keyNames
+	# Unknown or non-keyboard gestures do not provide enough information to
+	# choose a boundary. In particular, do not guess on a one-line document.
+	return None
+
+
+def _callWithCaretMoveObservation(
+	obj: editableText.EditableText,
+	original: _EditableTextCaretMovementScript,
+	gesture: inputCore.InputGesture,
+	unit: _TextUnit,
+) -> textInfos.TextInfo | None:
+	"""Observe NVDA's completed caret wait without sending or waiting a second time."""
+	methodName = "_hasCaretMoved"
+	originalWait = obj._hasCaretMoved
+	hadInstanceOverride = methodName in obj.__dict__
+	instanceOverride = obj.__dict__.get(methodName)
+	observedInfo = None
+
+	@functools.wraps(originalWait)
+	def observe(*args: Any, **kwargs: Any) -> Any:
+		nonlocal observedInfo
+		result = originalWait(*args, **kwargs)
+		# None means an interrupted wait or an unavailable caret, not a boundary.
+		# Copy before _caretScriptPostMovedHelper expands the returned range for
+		# speech. The boolean alone is insufficient: a caret event may be fired
+		# even when Word leaves the insertion point at exactly the same position.
+		try:
+			observedInfo = result[1].copy() if result[1] is not None else None
+		except Exception:
+			log.debugWarning("Unable to copy observed caret for boundary feedback", exc_info=True)
+			observedInfo = None
+		return result
+
+	setattr(obj, methodName, observe)
 	try:
-		previousInfo = info.copy()
-		canMovePrevious = previousInfo.move(unit, -1) != 0
-		nextInfo = info.copy()
-		canMoveNext = nextInfo.move(unit, 1) != 0
-	except Exception:
-		log.debugWarning("Unable to infer text boundary direction", exc_info=True)
-		return _GENERIC
-	if canMovePrevious == canMoveNext:
-		return None if canMovePrevious else _GENERIC
-	return _NEXT if canMovePrevious else _PREVIOUS
+		original(obj, gesture, unit)
+	finally:
+		if hadInstanceOverride:
+			setattr(obj, methodName, instanceOverride)
+		else:
+			delattr(obj, methodName)
+	return observedInfo
 
 
 def _directionFromBrowseDirection(direction: _BrowseDirection) -> _BoundaryDirection:
@@ -1075,27 +1106,49 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 				== addonConfig.BoundaryFeedbackMode.NVDA_DEFAULT
 			):
 				return original(editableTextObj, gesture, unit)
+			movement = _caretMovementFromGesture(gesture)
+			if (
+				movement is None
+				or scriptHandler.isScriptWaiting()
+				or eventHandler.isPendingEvents("gainFocus")
+			):
+				return original(editableTextObj, gesture, unit)
+			boundaryDirection, lineBoundaryOnly = movement
+			focusBefore = api.getFocusObject()
 			try:
-				before = editableTextObj.makeTextInfo(textInfos.POSITION_CARET).copy()
+				before = editableTextObj.makeTextInfo(textInfos.POSITION_SELECTION).copy()
+				# Collapsing a selection is successful navigation even if its start
+				# (what POSITION_CARET reports for Word) does not change.
+				hadSelection = not before.isCollapsed
 			except Exception:
 				original(editableTextObj, gesture, unit)
 				return
+			if hadSelection:
+				return original(editableTextObj, gesture, unit)
 			beforeValueSnapshot = _getEditableValueSnapshot(editableTextObj)
-			original(editableTextObj, gesture, unit)
+			observedInfo = _callWithCaretMoveObservation(editableTextObj, original, gesture, unit)
+			if (
+				observedInfo is None
+				or scriptHandler.isScriptWaiting()
+				or eventHandler.isPendingEvents("gainFocus")
+				or api.getFocusObject() != focusBefore
+				or not _sameTextRange(before, observedInfo)
+			):
+				return
 			afterValueSnapshot = _getEditableValueSnapshot(editableTextObj)
 			try:
-				after = editableTextObj.makeTextInfo(textInfos.POSITION_CARET).copy()
+				after = editableTextObj.makeTextInfo(textInfos.POSITION_SELECTION).copy()
 			except Exception:
 				return
 			if _sameTextRange(before, after):
 				if beforeValueSnapshot != afterValueSnapshot:
 					return
-				boundaryDirection = _directionFromTextBoundary(after, unit)
-				if boundaryDirection is not None:
-					self._playBoundarySoundForScenario(
-						addonConfig.SCENARIO_EDITABLE_TEXT_CARET,
-						boundaryDirection,
-					)
+				if lineBoundaryOnly and not _lineBoundaryIsDocumentBoundary(after, boundaryDirection):
+					return
+				self._playBoundarySoundForScenario(
+					addonConfig.SCENARIO_EDITABLE_TEXT_CARET,
+					boundaryDirection,
+				)
 
 		self._installMethodPatch(editableText.EditableText, "_caretMovementScriptHelper", replacement)
 
